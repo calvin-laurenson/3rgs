@@ -65,3 +65,4 @@ dmypy.json
 
 # Logs
 *.log
+vggt_1B_commercial.pt

@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import json
 from typing import Any, Dict, List, Optional
@@ -7,7 +8,7 @@ import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from pycolmap import SceneManager
+from pycolmap import Reconstruction, CameraModelId
 
 from .normalize import (
     align_principle_axes,
@@ -16,6 +17,7 @@ from .normalize import (
     transform_points,
 )
 import tqdm
+import evo.core.geometry as geometry
 
 
 def _get_rel_paths(path_dir: str) -> List[str]:
@@ -49,25 +51,27 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
-        manager.load_cameras()
-        manager.load_images()
-        manager.load_points3D()
+        manager = Reconstruction(colmap_dir)
+
+        # point_id -> point3D_id_contiguous
+        point3D_id_contiguous = dict()
+        for i, point_id in enumerate(manager.points3D.keys()):
+            point3D_id_contiguous[point_id] = i
 
         # Extract extrinsic matrices in world-to-camera format.
         imdata = manager.images
         w2c_mats = []
         camera_ids = []
         Ks_dict = dict()
+        point_indices = defaultdict(list) # image_name -> [point_idx]
         params_dict = dict()
         imsize_dict = dict()  # width, height
         mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
-            rot = im.R()
-            trans = im.tvec.reshape(3, 1)
-            w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+            w2c = im.cam_from_world.matrix()
+            w2c = np.concatenate([w2c, bottom], axis=0)
             w2c_mats.append(w2c)
 
             # support different camera intrinsics
@@ -76,30 +80,37 @@ class Parser:
 
             # camera intrinsics
             cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+            K = cam.calibration_matrix()
             K[:2, :] /= factor
             Ks_dict[camera_id] = K
+            for obs_point2d in im.points2D:
+                point_indices[im.name].append(point3D_id_contiguous[obs_point2d.point3D_id])
 
             # Get distortion parameters.
-            type_ = cam.camera_type
-            if type_ == 0 or type_ == "SIMPLE_PINHOLE":
+            type_ = cam.model
+            # SIMPLE_PINHOLE:     f, cx, cy
+            if type_ == CameraModelId.SIMPLE_PINHOLE:
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 1 or type_ == "PINHOLE":
+            # PINHOLE:            fx, fy, cx, cy
+            elif type_ == CameraModelId.PINHOLE:
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
-            if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
+            # SIMPLE_RADIAL:      f, cx, cy, k
+            if type_ == CameraModelId.SIMPLE_RADIAL:
+                params = np.array([cam.params[3], 0.0, 0.0, 0.0], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 3 or type_ == "RADIAL":
-                params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
+            # RADIAL:             f, cx, cy, k1, k2
+            elif type_ == CameraModelId.RADIAL:
+                params = np.array([cam.params[3], cam.params[4], 0.0, 0.0], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 4 or type_ == "OPENCV":
-                params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
+            # OPENCV:             fx, fy, cx, cy, k1, k2, p1, p2
+            elif type_ == CameraModelId.OPENCV:
+                params = np.array([cam.params[4], cam.params[5], cam.params[6], cam.params[7]], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 5 or type_ == "OPENCV_FISHEYE":
-                params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
+            # OPENCV_FISHEYE:     fx, fy, cx, cy, k1, k2, k3, k4
+            elif type_ == CameraModelId.OPENCV_FISHEYE:
+                params = np.array([cam.params[4], cam.params[5], cam.params[6], cam.params[7]], dtype=np.float32)
                 camtype = "fisheye"
             assert (
                 camtype == "perspective" or camtype == "fisheye"
@@ -114,7 +125,7 @@ class Parser:
 
         if len(imdata) == 0:
             raise ValueError("No images found in COLMAP.")
-        if not (type_ == 0 or type_ == 1):
+        if not (type_ == CameraModelId.PINHOLE or type_ == CameraModelId.SIMPLE_PINHOLE):
             print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
         w2c_mats = np.stack(w2c_mats, axis=0)
@@ -155,7 +166,7 @@ class Parser:
         else:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
-
+        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
         # Create resized image directory if it doesn't exist
         if not os.path.exists(image_dir):
             os.makedirs(image_dir)
@@ -187,18 +198,11 @@ class Parser:
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
-        # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
-        point_indices = dict()
-
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
+        # 3D points
+        points3D = manager.points3D.values()
+        points_err = np.array([p.error for p in points3D], dtype=np.float32)
+        points_rgb = np.array([p.color for p in points3D], dtype=np.uint8)
+        points = np.array([p.xyz for p in points3D], dtype=np.float32)
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
@@ -242,6 +246,7 @@ class Parser:
             K[1, :] *= s_height
             self.Ks_dict[camera_id] = K
             width, height = self.imsize_dict[camera_id]
+            self.image_size = (int(width * s_width), int(height * s_height))
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
         # undistortion
@@ -340,6 +345,13 @@ class Dataset:
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
 
+        kays = []
+        for i in range(len(self)):
+            K = self[i]["K"].numpy()
+            kays.append(K)
+        self.intrinsics = np.stack(kays, axis=0)
+
+
     def __len__(self):
         return len(self.indices)
 
@@ -433,3 +445,14 @@ if __name__ == "__main__":
             cv2.circle(image, (int(x), int(y)), 2, (255, 0, 0), -1)
         writer.append_data(image)
     writer.close()
+def align_pose(pose_a, pose_b):
+    # Calculate alignment parameters using umeyama
+    r, t, c = geometry.umeyama_alignment(pose_a[:,:3,3].T, pose_b[:,:3,3].T, with_scale=True)
+            
+    # Create 4x4 transformation matrix
+    device = pose_a.device if torch.is_tensor(pose_a) else torch.device('cpu')
+    transform = torch.eye(4, device=device)
+    transform[:3,:3] = c * torch.from_numpy(r).to(device).float()  # Apply rotation and scale
+    transform[:3,3] = torch.from_numpy(t).to(device).float()  # Add translation
+
+    return transform

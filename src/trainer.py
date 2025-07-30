@@ -18,7 +18,8 @@ import viser
 import yaml
 import kornia
 #from datasets.colmap import Dataset, Parser
-from datasets.mast3r import Dataset, Parser, CorrespondenceDataset, align_pose
+# from datasets.mast3r import Dataset, Parser, CorrespondenceDataset, align_pose
+from datasets.colmap import Dataset, Parser, align_pose
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -54,7 +55,7 @@ from utils.eval_utils import eval_ate
 @dataclass
 class Config:
     # use epipolar loss
-    use_corres_epipolar_loss: bool = True 
+    use_corres_epipolar_loss: bool = False 
     epi_loss_weight: float = 2.0 
 
     # Enable camera optimization.
@@ -70,16 +71,16 @@ class Config:
     # Enable camera intrinsics optimization
     intrinsics_opt: bool = False
     # Learning rate for intrinsics optimization
-    focal_opt_lr: float = 0.0001
-    pp_opt_lr: float = 0
+    focal_opt_lr: float = 0.001
+    pp_opt_lr: float = 0.001
     # Regularization for intrinsics optimization as weight decay  
     focal_opt_reg: float = 0 #1e-5
-    pp_opt_reg: float = 0 
+    pp_opt_reg: float = 0
     # Add noise to camera intrinsics. This is only to test the intrinsics optimization.
     intrinsics_noise: float = 0.0
 
     # Disable viewer
-    disable_viewer: bool = True
+    disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -336,10 +337,10 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            verbose=True
+            
         )
         self.trainvalset = Dataset(self.parser, split="train")
-        self.valset = Dataset(self.parser, split="val", verbose=True)
+        self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -501,7 +502,7 @@ class Runner:
                 render_fn=self._viewer_render_fn,
                 mode="training",
             )
-    def optim_camtoworlds(self, camtoworlds, Ks, width, height, sh_degree, near_plane, far_plane, masks, pixels, image_id, show_progress=False):
+    def optim_camtoworlds(self, camtoworlds, Ks, width, height, sh_degree, near_plane, far_plane, masks, pixels, image_id, show_progress=True):
         with torch.enable_grad():
             iters = 100 #* 2
             pose_opt_lr = 8e-4
@@ -1105,81 +1106,81 @@ class Runner:
         b = torch.stack(camtoworlds_gt,dim=0).squeeze(1).detach().cpu().numpy()
         transform = align_pose(b, a).to(device)
 
-        for i, data in enumerate(valloader):
-            camtoworlds = data["camtoworld_gt"].to(device)
-            camtoworlds = torch.einsum('ij,bjk->bik', transform, camtoworlds)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
-            height, width = pixels.shape[1:3]
+        # for i, data in enumerate(valloader):
+        #     camtoworlds = data["camtoworld_gt"].to(device)
+        #     camtoworlds = torch.einsum('ij,bjk->bik', transform, camtoworlds)
+        #     Ks = data["K"].to(device)
+        #     pixels = data["image"].to(device) / 255.0
+        #     masks = data["mask"].to(device) if "mask" in data else None
+        #     height, width = pixels.shape[1:3]
 
-            # intrinsics optimization
-            if cfg.intrinsics_opt:
-                Ks = torch.eye(3, dtype=torch.float32, device=device)[None].expand(camtoworlds.shape[0], 3, 3).clone()
-                Ks[:, 0, 0] = Ks[:, 1, 1] = self.focal_opt.exp()
-                Ks[:, 0:2, 2] = self.pp_opt * self.imsize
+        #     # intrinsics optimization
+        #     if cfg.intrinsics_opt:
+        #         Ks = torch.eye(3, dtype=torch.float32, device=device)[None].expand(camtoworlds.shape[0], 3, 3).clone()
+        #         Ks[:, 0, 0] = Ks[:, 1, 1] = self.focal_opt.exp()
+        #         Ks[:, 0:2, 2] = self.pp_opt * self.imsize
 
-            torch.cuda.synchronize()
-            tic = time.time()
-            camtoworlds = self.optim_camtoworlds(camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-                pixels=pixels,
-                image_id=i,
-            )
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-                masks=masks,
-            )  # [1, H, W, 3]
-            torch.cuda.synchronize()
-            ellipse_time += time.time() - tic
+        #     torch.cuda.synchronize()
+        #     tic = time.time()
+        #     camtoworlds = self.optim_camtoworlds(camtoworlds=camtoworlds,
+        #         Ks=Ks,
+        #         width=width,
+        #         height=height,
+        #         sh_degree=cfg.sh_degree,
+        #         near_plane=cfg.near_plane,
+        #         far_plane=cfg.far_plane,
+        #         masks=masks,
+        #         pixels=pixels,
+        #         image_id=i,
+        #     )
+        #     renders, _, _ = self.rasterize_splats(
+        #         camtoworlds=camtoworlds,
+        #         Ks=Ks,
+        #         width=width,
+        #         height=height,
+        #         sh_degree=cfg.sh_degree,
+        #         near_plane=cfg.near_plane,
+        #         far_plane=cfg.far_plane,
+        #         render_mode="RGB+ED",
+        #         masks=masks,
+        #     )  # [1, H, W, 3]
+        #     torch.cuda.synchronize()
+        #     ellipse_time += time.time() - tic
 
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
+        #     colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+        #     depths = renders[..., 3:4]  # [1, H, W, 1]
 
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [pixels, colors, (pixels-colors).abs(), depths.repeat(1,1,1,3)]
+        #     depths = (depths - depths.min()) / (depths.max() - depths.min())
+        #     canvas_list = [pixels, colors, (pixels-colors).abs(), depths.repeat(1,1,1,3)]
 
-            if world_rank == 0:
-                # Save rendered image
-                rendered_img = (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/rendered_{i:04d}.png", 
-                    rendered_img
-                )
+        #     if world_rank == 0:
+        #         # Save rendered image
+        #         rendered_img = (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        #         imageio.imwrite(
+        #             f"{self.render_dir}/rendered_{i:04d}.png", 
+        #             rendered_img
+        #         )
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
+        #         pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+        #         colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+        #         metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+        #         metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+        #         metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+        #         if cfg.use_bilateral_grid:
+        #             cc_colors = color_correct(colors, pixels)
+        #             cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+        #             metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
         
         # eval ate
-        if pesudo_gt:
-            print("pesudo gt!!")
-        ape_stats = eval_ate(
-            camtoworlds_est, 
-            camtoworlds_gt,
-            self.stats_dir,
-            step,
-            monocular=True,
-        )
+        # if pesudo_gt:
+        #     print("pesudo gt!!")
+        # ape_stats = eval_ate(
+        #     camtoworlds_est, 
+        #     camtoworlds_gt,
+        #     self.stats_dir,
+        #     step,
+        #     monocular=True,
+        # )
 
 
         if world_rank == 0:
@@ -1195,7 +1196,7 @@ class Runner:
             )
             print(
                 f"TRAIN PSNR: {train_stats['psnr']:.3f}, TRAIN SSIM: {train_stats['ssim']:.4f}, TRAIN LPIPS: {train_stats['lpips']:.3f} "
-                f"TEST PSNR: {stats['psnr']:.3f}, TEST SSIM: {stats['ssim']:.4f}, TEST LPIPS: {stats['lpips']:.3f} "
+                # f"TEST PSNR: {stats['psnr']:.3f}, TEST SSIM: {stats['ssim']:.4f}, TEST LPIPS: {stats['lpips']:.3f} "
                 f"Time: {stats['ellipse_time']:.3f}s/image "
                 f"Number of GS: {stats['num_GS']}"
             )
